@@ -1,0 +1,502 @@
+---
+title: "AFRS Job Matching Optimizer"
+output: 
+  html_document:
+    code_folding: hide
+author: "Capt Lance Wilhelm"
+date: '`r format(Sys.time(), "%d %B %Y %H:%M")`'
+---
+
+```{r setup, include=FALSE}
+library(knitr)
+library(ggplot2)
+library(CVXR)
+library(Rglpk)
+library(stringr)
+library(dplyr)
+library(lubridate)
+library(tidyr)
+library(readxl)
+knitr::opts_chunk$set(echo = T, fig.align = "center", out.width = "80%", dpi = 300)
+options(dplyr.summarise.inform = FALSE)
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+# setwd("/Users/lance/Projects/afrs/r_optimizer")
+```
+
+```{r variables}
+# Establish variables for use in filtering
+start_dates = ymd(c("2023-04-21"))
+end_dates = ymd(c("2023-09-30"))
+distro_path = '~/Analysis/Data/Job Distro/361distro_20230504.csv'
+qw_path = '~/Analysis/Data/QW/QW Report_20230504_11_48.csv'
+ammo_path = NA
+jobs_filter = NA
+ed_codes = NA
+weights = c(0, 0.5, 0.5, 0) # (Number of matches, days in DEP, preference score, recruiter delta to goal)
+```
+
+This report is the R version of the optimizer first created using python. This tool will attempt to match jobs using a mixed integer program (MIP) which will yield the optimal result for job matches or whatever objective function is specified
+
+**For this report, the following filtering criteria was used:**
+
+* **Start Date(s):** `r toString(start_dates)`
+* **End Date(s):** `r toString(end_dates)`
+* **Education Code(s):** `r toString(ed_codes)`
+
+**Only applicants that have that education code (if not NA) and EAD From dates within or before this range will be considered for jobs that leave within this range.**
+
+## Import the data
+
+```{r data_import, echo=F, results='hide', warning=FALSE}
+# Check that the start and end dates have the same number of entries
+if(length(start_dates) != length(end_dates)){
+  stop('ERROR: Number of start dates does not match number of end dates. Please fix!')
+}
+squadrons_372 = c("343", "347", "361", "362", "364", "367", "368", "369")
+sq361_flights = c('A')
+pref_names = c("AFSC.Pref.1","AFSC.Pref.2","AFSC.Pref.3","AFSC.Pref.4","AFSC.Pref.5","AFSC.Pref.6","AFSC.Pref.7","AFSC.Pref.8","AFSC.Pref.9","AFSC.Pref.10","AFSC.Pref.11","AFSC.Pref.12","AFSC.Pref.13","AFSC.Pref.14","AFSC.Pref.15","AFSC.Pref.16","AFSC.Pref.17","AFSC.Pref.18","AFSC.Pref.19","AFSC.Pref.20")
+
+datetime = format(Sys.time(), "%Y%m%d_%H_%M_%S")
+export_dir = paste('export/', datetime, sep = '')
+
+# create export directory if it does not exist
+if (!file.exists(export_dir)) {
+  dir.create(file.path(getwd(), export_dir))
+}
+
+# Get the jobs distro and filter the list and group similar AFSCs and EADs together
+jobs = read.csv(distro_path)
+jobs$EAD = dmy(jobs$EAD)
+if(any(!is.na(jobs_filter))){
+  jobs = filter(jobs, Organization.ID.Owner %in% jobs_filter)  
+}
+jobs = jobs %>% group_by(AFSC, AWG, EAD) %>% summarise(Seats.Released = sum(Seats.Released), Seats.Sold = sum(Seats.Sold), Seats.Remaining = sum(Seats.Remaining))
+
+# Get the AFRS QW
+qw = read.csv(qw_path, na.strings = "")
+qw$DEP.Date = dmy(qw$DEP.Date)
+qw$EAD.From = dmy(qw$EAD.From)
+qw$EAD.To = dmy(qw$EAD.To)
+qw$squadron = paste("3", substr(qw$RIC, start=1, stop=2), sep = "")
+qw$job.count = rowSums(!is.na(qw[,pref_names]))
+qw$flight = substr(qw$RIC, 3, 3)
+qw$matched.afsc = NA
+qw$matched.ead = ymd(NA)
+qw$matched.pref = NA
+qw$Days.in.DEP = as.integer(difftime(Sys.Date(), qw$DEP.Date, units = "days"))
+if (any(!is.na(ed_codes))){
+  qw = filter(qw, ED.Code.AF %in% ed_codes)
+}
+
+# Remove Duplicates
+qw = qw[!duplicated(qw),]
+
+# Availability function used to indicate available
+availability = function(x) {
+  return(x$EAD.From < end_date)  
+}
+
+# Import the AMMO which may be used for high water job matching
+if (!is.na(ammo_path)){
+  # Import the ammo
+  ammo = read_excel(ammo_path, skip = 8, col_names = F)
+  
+  # rename the columns
+  names(ammo) = apply(ammo, 2, function(x) paste(x[1], x[2], sep = "."))
+  
+  # Use a loop to check for duplicate column names
+  duplicate_columns <- unique(names(ammo)[duplicated(names(ammo))])
+
+  # Use the names() function and the loop to rename the duplicate columns
+  for (i in duplicate_columns) {
+    names(ammo)[names(ammo) == i] <- paste0(i, "_", 1:sum(names(ammo) == i))
+  }
+  
+  # Trim off the first two rows
+  ammo = ammo[3:nrow(ammo),]
+  
+  # Filter out rows with no units
+  ammo = filter(ammo, NA.UNIT != '-')
+  
+  # Create a RIC column
+  ammo$RIC = substr(ammo$NA.UNIT, 1, 7)
+  non_ric_rows = which(substr(ammo$RIC, 1, 2) != '61')
+  ammo$RIC[non_ric_rows] = NA
+  
+  # Create a dataframe with only the RIC name, delta, and RIC
+  ric_need = ammo[, c('NA.UNIT', 'Delta (Need).NA_1', 'RIC')]
+  ric_need = filter(ric_need, !is.na(RIC))
+  names(ric_need) = c('Name','Delta','RIC')
+  ric_need$Delta = as.integer(ric_need$Delta)
+  ric_need = arrange(ric_need, Delta)
+}
+```
+The QW used for this report was `r qw_path`, and the job distro was `r distro_path`.
+
+```{r functions}
+generate_Non_Availability = function(qw, start_date, end_date){
+  # Checks the QW for reasons for nonavailability
+  #
+  # params:
+  # qw = the qw to check for non_a reasons
+  # start_date = beginning of the date range
+  # end_date = end of the date range
+  #
+  # returns:
+  # non_available = dataframe containing the non_a reasons
+  
+  df = data.frame(qw) # create a new copy of the qw for use here
+  non_available = data.frame()
+  non_available = rbind(non_available, data.frame(reason = "EAD From date", count = nrow(filter(df, EAD.From > end_date))))
+  non_available = rbind(non_available, data.frame(reason = "EAD To date", count = nrow(filter(df, (EAD.To < start_date & !is.na(EAD.To))))))
+  non_available = rbind(non_available, data.frame(reason = "DEP Date Blank", count = nrow(filter(df, is.na(DEP.Date)))))
+  non_available = rbind(non_available, data.frame(reason = "EAD From Date Blank", count = nrow(filter(df, is.na(EAD.From)))))
+  non_available = rbind(non_available, data.frame(reason = "Blank AFSC Prefs", count = nrow(filter(df, if_all(pref_names, function(x) x == '')))))
+  non_available = rbind(non_available, data.frame(reason = "8D100", count = nrow(filter(df, AFSC.Pref.1 == "8D100"))))
+  non_available = rbind(non_available, data.frame(reason = "SW", count = nrow(filter(df, AFSC.Pref.1 == "9T500"))))
+  non_available = rbind(non_available, data.frame(reason = "USSF", count = nrow(filter(df, startsWith(AFSC.Pref.1, "S")))))
+  non_available = rbind(non_available, data.frame(reason = "8D100 w/ Good EAD.From", count = nrow(filter(df, EAD.From <= end_date, AFSC.Pref.1 == "8D100"))))
+  non_available = rbind(non_available, data.frame(reason = "Blank AFSCs w/ Good EAD.From", count = nrow(filter(df, EAD.From <= end_date, if_all(pref_names, function(x) x == '')))))
+  non_available = rbind(non_available, data.frame(reason = "Matched", count = nrow(filter(df, !is.na(matched.afsc)))))
+  return(non_available)
+}
+
+generate_Available_QW = function(qw, start_date, end_date){
+  df = data.frame(qw)
+  available_qw = data.frame()
+  available_qw = filter(df, EAD.From <= end_date & (EAD.To >= start_date | is.na(EAD.To)) & !is.na(DEP.Date) & !is.na(EAD.From) & if_any(pref_names, function(x) x != '') & AFSC.Pref.1 != "8D100" & !(AFSC.Pref.1 == "9T500" & job.count == 1) & is.na(matched.afsc))
+  return(available_qw)
+}
+
+generate_Available_Jobs = function(jobs, start_date, end_date){
+  available_jobs = data.frame()
+  # Filter the jobs by EAD date
+  available_jobs = filter(jobs, EAD >= start_date, EAD <= end_date)
+  return(available_jobs)
+}
+
+generate_Job_Deltas = function(available_qw, available_jobs){
+  prefs = available_qw[,pref_names]
+  interest_count = data.frame(table(unlist(prefs)))
+  interest_count = rename(interest_count, AFSC = Var1, QW.Interest = Freq)
+  jobs_counts = summarize(group_by(available_jobs, AFSC), count = sum(Seats.Remaining))
+  jobs_counts = rename(jobs_counts, Distro.Count = count)
+  job_deltas = left_join(jobs_counts, interest_count, by = "AFSC")
+  job_deltas[is.na(job_deltas)] = 0
+  job_deltas$Delta = job_deltas$Distro.Count - job_deltas$QW.Interest
+  job_deltas = arrange(job_deltas, desc(Delta))
+  return(job_deltas)
+}
+
+get_eligibility = function(job, qw) {
+  return(filter(qw, if_any(pref_names, (function(x) x == job$AFSC)), EAD.From <= job$EAD, (EAD.To >= job$EAD | is.na(EAD.To)))$app.id)
+}
+
+get_pref_score = function(app.id, afsc, qw) {
+  return(20 - (which(qw[app.id, pref_names] == afsc) - 1))
+}
+
+match_MIP_weighted = function(qw, jobs, w) {
+ # establish the dataframes and variables
+  qw_df = data.frame(qw)
+  qw_df$app.id = seq(nrow(qw_df))
+  jobs_df = data.frame(jobs)
+  n_apps = nrow(qw_df)
+  n_jobs = sum(jobs_df$Seats.Remaining)
+  jobs_expanded = data.frame(jobs_df[rep(seq(dim(jobs_df)[1]), jobs_df$Seats.Remaining),])[,c('AFSC', 'EAD')]
+  eligibility = array(0, dim = c(n_apps, n_jobs))
+  pref_matrix = array(0, dim = c(n_apps, n_jobs))
+  days_in_dep = matrix(qw_df$Days.in.DEP)[, rep(1, n_jobs)]
+  
+  # Build the eligibility matrix
+  for (i in seq_along(jobs_expanded[,1])) {
+    eligible = get_eligibility(jobs_expanded[i,], qw_df)
+    if (length(eligible) != 0) {
+      eligibility[eligible, i] = 1
+      prefs = sapply(eligible, function(x) get_pref_score(x, jobs_expanded[i,]$AFSC, qw_df))
+      pref_matrix[eligible, i] = prefs
+    }
+  }
+
+  if (!sum(eligibility)){
+    jobs_expanded$matches = 0
+    jobs_expanded$total.seats = rep(1, nrow(jobs_expanded))
+    resulting_jobs = summarize(group_by(jobs_expanded, AFSC, EAD), total.seats = sum(total.seats), matches = sum(matches))
+    resulting_jobs$remaining.seats = resulting_jobs$total.seats - resulting_jobs$matches
+    return(list(resulting_jobs = resulting_jobs, resulting_qw = qw_df))
+  }
+  
+  # Generate the RIC delta vector to take into consideration recruiters who have not made it to goal yet
+  if (!is.na(ammo_path)){
+    qw_df = select(left_join(qw_df, ric_need, by = 'RIC'), -Name)
+    qw_df$Delta = ifelse(qw_df$Delta > 0, 0, -1)
+    neg_deltas = qw_df$Delta
+    in_need = ifelse(neg_deltas < 0, 1, 0)
+  } else {
+    qw_df$Delta = 0
+    neg_deltas = qw_df$Delta
+    in_need = ifelse(neg_deltas < 0, 1, 0)
+  }
+  
+  matches = Variable(n_apps, n_jobs, boolean = T)
+  constaints <- list(
+    sum_entries(matches, axis=2) <= matrix(1, n_jobs),
+    sum_entries(matches, axis=1) <= matrix(1, n_apps),
+    matches <= eligibility
+  )
+  
+  objective = Maximize(w[1] * (sum_entries(matches) / n_apps) + w[2] * (sum_entries(multiply(matches, days_in_dep)) / (365 * n_apps)) + w[3] * (sum_entries(multiply(matches, pref_matrix)) / (20 * n_apps)) + w[4] * (sum_entries(multiply((sum_entries(matches, axis=1) + neg_deltas), in_need) + 1) / n_apps))
+  
+  problem = Problem(objective, constaints)
+  result <- solve(problem, solver='GLPK')
+  resulting_matches = result$getValue(matches)
+  
+  # indicate the jobs that matched
+  jobs_expanded$matches = colSums(resulting_matches)
+  jobs_expanded$total.seats = rep(1, nrow(jobs_expanded))
+  resulting_jobs = summarize(group_by(jobs_expanded, AFSC, EAD), total.seats = sum(total.seats), matches = sum(matches))
+  resulting_jobs$remaining.seats = resulting_jobs$total.seats - resulting_jobs$matches
+  
+  # if an applicant matched then write the job to the resulting_qw
+  resulting_qw = qw_df
+  resulting_qw$matched.afsc = NA
+  resulting_qw$matched.ead = ymd(NA)
+  resulting_qw$matched.pref = NA
+  for (i in seq_along(resulting_matches[,1])) {
+    matched_job_idx = which(resulting_matches[i,] == 1)
+    if (length(matched_job_idx) != 0) {
+      resulting_qw$matched.afsc[i] = jobs_expanded$AFSC[matched_job_idx]
+      resulting_qw$matched.ead[i] = jobs_expanded$EAD[matched_job_idx]
+      resulting_qw$matched.pref[i] = which(resulting_qw[i, pref_names] == jobs_expanded$AFSC[matched_job_idx])
+    } else {
+      resulting_qw$matched.afsc[i] = NA
+      resulting_qw$matched.ead[i] = NA
+    }
+  }
+  resulting_qw = select(resulting_qw, -app.id)
+  return(list(resulting_jobs = resulting_jobs, resulting_qw = resulting_qw))
+}
+```
+
+## Job Deltas
+
+We will create a table containing statistics for each of the jobs on the job distro that will highlight any disparity between the number of jobs available and the number of applicants interested in that job. The jobs listed below are only jobs with an EAD in the range `r start_dates[1]` to `r end_dates[length(end_dates)]` for the group.
+
+```{r job_deltas}
+available_qw = generate_Available_QW(qw, start_dates[1], end_dates[(length(end_dates))])
+available_jobs = generate_Available_Jobs(jobs, start_dates[1], end_dates[(length(end_dates))])
+kable(generate_Job_Deltas(available_qw, available_jobs))
+```
+
+## Reasons for non-availability
+
+The following are the reasons for non-available applicants in the date range `r start_dates[1]` to `r end_dates[length(end_dates)]`.
+
+```{r non_as}
+kable(generate_Non_Availability(qw, start_dates[1], end_dates[(length(end_dates))]))
+```
+
+## Match jobs
+
+Jobs will be matched to applicants using a [mixed integer program](https://en.wikipedia.org/wiki/Integer_programming). This will provide the optimal number of matches which is something that recursive matching cannot guarantee. This, however, limits portability to a macro-based excel sheet.
+
+The program will be written as a maximization program with the objective function written so that weights can tune what features will be taken into consideration for matching. The 3 features that are considered are
+
+* Number of matched jobs
+* Total days in DEP of applicants matched
+* Total preference score of applicants matched
+
+$$
+\begin{aligned}
+max \quad &\frac{w_1}{m}\sum_{i=1}^{m} \sum_{j=1}^{n} x_{ij} + \frac{w_2}{365m}\sum_{i=1}^{m} \sum_{j=1}^{n} x_{ij}d_{i} + \frac{w_3}{20m}\sum_{i=1}^{m} \sum_{j=1}^{n} x_{ij}p_{ij}\\
+s.t. \quad &\sum_{i=1}^{m} x_{ij} \leq 1, \quad \forall j \\
+&\sum_{j=1}^{n} x_{ij} \leq 1, \quad \forall i \\
+&x_{ij} \leq e_{ij}, \quad \forall i, \forall j \\
+&x_{ij} \in \{0,1\}, \quad \forall i, \forall j \\
+&e_{ij} \in \{0,1\}, \quad \forall i, \forall j \\
+&0 \leq w_{i} \leq 1, \quad \forall i \\
+&\sum_{i=1}^{3} w_{i} = 1
+\end{aligned}
+$$
+In the mixed integer linear program above, the objective function is the maximization of the weighted combination of total number of matches, total days in the dep, and total preference score. The matrix $x$ represents the match matrix where $x_{ij} = 1$ represents a match of applicant $i$ with job $j$. The vector $d_i$ is the number of days in the DEP for applicant $i$, $p_{ij}$ is the preference matrix which holds the preference scores for each applicant. Each component of the objective function is normalized before combination in order to allow for the weights to have an effect. 
+
+The first constraint ensures that only 1 applicant can be matched to a job and the second constraint ensures that an applicant can only be matched to one job. The third constraint ensures that an applicant can only be matched to a job that they are eligible for where $e_{ij}$ represents the eligibility matrix and $e_{ij} = 1$ represents that applicant $i$ is eligible to match with job $j$. The last constraints pertaining to $w_i$ ensure that each weight is between 0 and 1 as well as the sum of the weights must total to 1.
+
+After the MIP solver finds the optimal solution, we can use the resulting matrix $x$ to identify who was matched to what jobs.
+
+The initial weights for matching are `r weights[1]` for number of matches, `r weights[2]` for total days in DEP, `r weights[3]` for total preference score, and `r weights[4]` for recruiter goal delta.
+
+```{r matching, results='asis'}
+qws = list()
+jobs_results = list()
+qw_results = list()
+deltas = list()
+results = list()
+non_as = list()
+summary = data.frame()
+
+# Store the initial QW
+qws = append(qws, setNames(list(data.frame(qw)), 'init'))
+
+# Create dataframes for use in post export of the QW and the Jobs
+qw_post_match = data.frame(qw)
+jobs_post_match = data.frame(jobs)
+
+# Iterate over each of the date ranges and run the matching algorithm
+for (i in c(1:length(start_dates))){
+  start_date = start_dates[i]
+  end_date = end_dates[i]
+  # print(paste('Run:', i, ', Start Date:', start_date, ', End Date:', end_date))
+  
+  # Get the list of available jobs and QW
+  available_jobs = generate_Available_Jobs(jobs, start_date, end_date)
+  available_qw = generate_Available_QW(qws[[i]], start_date, end_date)
+  
+  # Run the optimizer if there are applicants and jobs available
+  if (nrow(available_jobs) & nrow(available_qw)){
+    # Store the job deltas table
+    deltas = append(deltas, setNames(list(generate_Job_Deltas(available_qw, available_jobs)), start_date))
+  
+    # Store the non-availability statistics
+    non_as = append(non_as, setNames(list(generate_Non_Availability(qws[[i]], start_date, end_date)), start_date))
+    
+    # Run the match and track the time
+    tic = Sys.time()
+    res = match_MIP_weighted(available_qw, available_jobs, weights)
+    toc = Sys.time()
+    runtime = difftime(toc, tic, units = c('secs'))  
+    
+    } else {
+      res$resulting_qw = available_qw
+      res$resulting_jobs = available_jobs
+    }
+  
+  # Store the resulting match QW
+  qw_results = append(qw_results, setNames(list(res$resulting_qw), start_date))
+  
+  # Store the resulting jobs
+  jobs_results = append(jobs_results, setNames(list(res$resulting_jobs), start_date))
+
+  # Append the matches to the QW used and store it as the qw for the next run
+  qw_post = data.frame(qws[[i]])
+  matches = filter(res$resulting_qw, !is.na(matched.afsc))
+  qw_post = bind_rows(anti_join(qw_post, matches, by='SSAN'), matches)
+  
+  # Store the QW for the next run
+  qws = append(qws, setNames(list(data.frame(qw_post)), i))
+  
+  # Print results to screen for quick logging
+  # print(paste('Matches:', sum(res$resulting_jobs$matches), ', out of ', nrow(res$resulting_qw), ' applicants and ', sum(res$resulting_jobs$total.seats), 'jobs'))
+  # print('---')
+  
+  # Write the available QW and available jobs to a file for debugging
+  write.csv(available_qw, paste(export_dir, '/available_qw_', i, '.csv', sep = ''))
+  write.csv(available_jobs, paste(export_dir, '/available_jobs_', i, '.csv', sep = ''))
+    
+  # summarize the statistics of the results
+  summary = rbind(summary, data.frame(start_date = start_date, end_date = end_date, matches = sum(res$resulting_jobs$matches), jobs =  sum(res$resulting_jobs$total.seats), remaining_seats = sum(res$resulting_jobs$total.seats) - sum(res$resulting_jobs$matches), available_apps = nrow(res$resulting_qw), job_match_rate = sum(res$resulting_jobs$matches) / sum(res$resulting_jobs$total.seats), app_match_rate = sum(res$resulting_jobs$matches) / nrow(res$resulting_qw), runtime = runtime))
+}
+
+qw_post_match = qws[[length(qws)]]
+jobs_post_match = arrange(bind_rows(jobs_results), EAD)
+
+# export the matching results
+write.csv(jobs_post_match, paste(export_dir, '/resulting_jobs_', datetime, '.csv', sep = ''))
+
+# export the qw, available_qw, and distro
+write.csv(qw_post_match, paste(export_dir, '/resulting_qw_', datetime, '.csv', sep = ''))
+
+cat('### Summary of Results')
+kable(summary)
+write.csv(summary, paste(export_dir, '/results_summary_', datetime, '.csv', sep = ''))
+```
+
+```{r match_results, results='asis'}
+  cat("### Matching Results", "\n")
+  print(ggplot(filter(qw_post_match, !is.na(matched.pref))) + geom_bar(aes(x = as.factor(matched.pref))) + labs(title = 'Matched Preference Distribution', x = 'Pref'))
+  
+  cat('#### Flight breakdown','\n')
+  print(ggplot(filter(qw_post_match, !is.na(matched.afsc))) + geom_bar(aes(x = as.factor(flight))) + labs(title = 'Flight Match Distribution', x = 'Flight'))
+  
+  cat('#### Weekly breakdown','\n')
+  print(kable(summarize(group_by(jobs_post_match, EAD), total.seats = sum(total.seats), matches = sum(matches), remaining.seats = sum(remaining.seats))))
+  
+  cat('#### Resulting Job Statistics','\n')
+  print(kable(filter(jobs_post_match)))
+```
+## RIC Deltas to Goal
+
+The following table displays the delta for each applicant to their goal, before and after the matching. This information is pulled from the AMMO report from AFRISS-TF.
+
+```{r ric_deltas}
+if(!is.na(ammo_path)){
+  # Get the match statistics for each RIC from the results
+  matches = filter(qw_post_match, !is.na(matched.afsc))
+  matches_ric_summary = count(matches, RIC)
+  names(matches_ric_summary)[2] = 'matches'
+  
+  # Update the ric_need dataframe
+  ric_need = left_join(ric_need, matches_ric_summary, by='RIC')
+  ric_need$matches = ifelse(is.na(ric_need$matches), 0, ric_need$matches)
+  ric_need$Delta.New = ric_need$Delta + ric_need$matches
+  
+  kable(ric_need)
+} else {
+  print('No AMMO provided')
+}
+```
+
+## Similar Jobs
+
+Some of the applicants that were available but not matched may have listed jobs that are similar to jobs that are on the job distro. In this section we will take those who are remaining and ID any jobs that they can potentially fill. The following individuals are those who did not match, who are available to match, and who have listed jobs that are similar to the remaining jobs that have not been filled. 
+
+```{r similar_jobs, results='asis', include=T}
+# import the job correlations
+corr_path = '~/Analysis/Data/AFSC Correlations/AFSC_correlations_v3.csv'
+afsc_correlations = read.csv(corr_path)
+corr_names = c('Close.match.1','Close.match.2','Close.match.3','Close.match.4')
+
+get_similar_jobs = function(afsc) {
+  similar = unlist(filter(afsc_correlations, AFSC == afsc)[,corr_names], use.names = F)
+  similar = similar[similar != '']
+  return(similar)
+}
+
+non_matched_qw = filter(qw_post_match, is.na(matched.afsc))
+remaining_jobs = filter(jobs_post_match, remaining.seats > 0)$AFSC
+
+# iterate over each applicant and look for similar jobs in the remaining jobs
+non_matched_qw$similar.remaining.jobs = NA
+non_matched_qw$similar.remaining.eads = NA
+for (i in seq(nrow(non_matched_qw))){
+  prefs = unlist(non_matched_qw[i,pref_names], use.names = F)
+  prefs = prefs[prefs != '']
+  similar = unlist(lapply(prefs, get_similar_jobs))
+  similar_in_remaining = Reduce(intersect, list(remaining_jobs, similar))
+  similar_in_remaining = filter(jobs_post_match, remaining.seats > 0, AFSC %in% similar_in_remaining, EAD >= non_matched_qw[i,]$EAD.From)
+  if (nrow(similar_in_remaining) != 0){
+    non_matched_qw[i,]$similar.remaining.jobs = toString(similar_in_remaining$AFSC)
+    non_matched_qw[i,]$similar.remaining.eads = toString(similar_in_remaining$EAD)
+  }
+}
+if (nrow(filter(non_matched_qw, !is.na(similar.remaining.jobs))) != 0){
+ print(kable(filter(non_matched_qw, !is.na(similar.remaining.jobs))))
+} else {
+  print('There were no similar job matches')
+}
+cat('\n')
+```
+
+```{r param_summary}
+# Output a file that contains the parameters so that a particular run may be replicated in the future
+param_summary = data.frame()
+param_summary = rbind(param_summary, data.frame(param = 'Start Dates', value = toString(start_dates)))
+param_summary = rbind(param_summary, data.frame(param = 'End Dates', value = toString(end_dates)))
+param_summary = rbind(param_summary, data.frame(param = 'Distro Path', value = distro_path))
+param_summary = rbind(param_summary, data.frame(param = 'QW Path', value = qw_path))
+param_summary = rbind(param_summary, data.frame(param = 'AMMO Path', value = ammo_path))
+param_summary = rbind(param_summary, data.frame(param = 'Job Filter', value = toString(jobs_filter)))
+param_summary = rbind(param_summary, data.frame(param = 'Ed Code Filter', value = toString(ed_codes)))
+param_summary = rbind(param_summary, data.frame(param = 'Weights', value = toString(weights)))
+write.csv(param_summary, paste(export_dir, '/parameters_', datetime, '.csv', sep = ''))
+```
